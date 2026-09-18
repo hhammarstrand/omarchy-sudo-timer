@@ -1,14 +1,19 @@
 # omarchy-sudo-timer
 
-Passwordless `sudo` for a length of time you pick — 5 minutes, an hour, 24 hours,
-or until you switch it off — instead of the usual all-or-nothing choice.
+Passwordless `sudo` for as long as you pick — 5 minutes, an hour, until the
+screen locks, until the next reboot, or until you switch it off — instead of the
+usual all-or-nothing choice.
 
-Built for [Omarchy](https://omarchy.org/), but the command itself only needs
-bash, sudo and systemd.
+Built for [Omarchy](https://omarchy.org/). Every mode but `lock` needs only
+bash, sudo and systemd; `lock` additionally uses Omarchy's
+`omarchy-hyprland-session-locked` to see the lock screen, and refuses to enable
+where that is missing.
 
 ```
 sudo-timer            # pick a duration from a menu
 sudo-timer 15m        # or 5m, 30m, 1h, 6h, 12h, 24h
+sudo-timer lock       # until you lock the screen, or reboot
+sudo-timer reboot     # until the next reboot
 sudo-timer forever    # until you turn it off
 sudo-timer status     # current mode and time left
 sudo-timer off        # revoke now
@@ -19,17 +24,36 @@ scripted use.
 
 ## How it works
 
-A drop-in in `/etc/sudoers.d` grants `NOPASSWD: ALL`, and three independent
+A drop-in in `/etc/sudoers.d` grants `NOPASSWD: ALL`, and four independent
 things remove it again:
 
-1. a systemd timer when the window expires,
-2. `sudo-timer off`,
-3. a boot-time cleanup unit.
+1. a systemd timer when a timed window expires,
+2. the lock watcher, when the session locks,
+3. `sudo-timer off`,
+4. a boot-time cleanup unit.
 
-The third one matters more than it looks. Transient systemd timers do not
+The last one matters more than it looks. Transient systemd timers do not
 survive a reboot, but the sudoers file does — so without it, rebooting in the
 middle of a 24-hour window would leave passwordless sudo on indefinitely.
-`forever` uses a separate filename that the cleanup deliberately spares.
+
+That cleanup deletes `99-sudo-timer-*`, and the filename is the whole
+mechanism. The timed, `lock` and `reboot` rules all match it, so `reboot` needs
+no code of its own and `lock` cannot outlive a reboot even if its watcher dies.
+`forever` is named `99-sudo-forever-*` and is deliberately spared.
+
+### The lock watcher
+
+`lock` starts a systemd **user** service, because the lock state can only be
+read from inside the graphical session. It polls Omarchy's own
+`omarchy-hyprland-session-locked` every 5 seconds
+(`SUDO_TIMER_LOCK_POLL` overrides that) and revokes on the first locked
+reading. It needs no privileges of its own: while the rule is in place, the
+`sudo` it calls to delete that rule is itself passwordless.
+
+The watcher exits as soon as the rule is gone, whoever removed it. If it dies
+early the grant simply reverts to lasting until reboot, and `status` says so
+instead of claiming a protection that is not running. Outside Omarchy the mode
+refuses to enable rather than pretend to watch.
 
 Three other details worth knowing:
 

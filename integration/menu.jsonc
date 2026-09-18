@@ -7,5 +7,7 @@
   "setup.security.passwordless-sudo.6h": {"icon":"","label":"6 hours","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer 6h\""},
   "setup.security.passwordless-sudo.12h": {"icon":"","label":"12 hours","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer 12h\""},
   "setup.security.passwordless-sudo.24h": {"icon":"","label":"24 hours","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer 24h\""},
+  "setup.security.passwordless-sudo.lock": {"icon":"󰌾","label":"Until screen lock","description":"Revoked when you lock, and at reboot","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer lock\""},
+  "setup.security.passwordless-sudo.reboot": {"icon":"󰜉","label":"Until reboot","description":"Survives locking, not a restart","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer reboot\""},
   "setup.security.passwordless-sudo.forever": {"icon":"","label":"Forever","description":"Until you turn it off, survives a reboot","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer forever\""},
   "setup.security.passwordless-sudo.off": {"icon":"󰅖","label":"Turn off now","action":"omarchy-launch-floating-terminal-with-presentation \"sudo-timer off\""},
