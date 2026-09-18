@@ -64,11 +64,6 @@ asking. That includes scripts and coding agents you started. A time limit makes
 that tolerable for a stretch of work; it does not make it safe. `forever` exists
 because it is sometimes the honest answer, not because it is a good default.
 
-## Note on language
-
-The command's output and prompts are in Swedish. Everything else — this README,
-the code and its comments — is in English.
-
 ## License
 
 MIT

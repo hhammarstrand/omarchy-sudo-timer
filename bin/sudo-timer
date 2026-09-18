@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# sudo-timer — lösenordsfri sudo under en vald tid.
+# sudo-timer — passwordless sudo for a length of time you pick.
 #
-#   sudo-timer              välj tid i en meny
-#   sudo-timer 15m          aktivera i 15 minuter
-#   sudo-timer 6h           aktivera i 6 timmar
-#   sudo-timer forever      aktivera tills vidare
-#   sudo-timer status       visa läge och återstående tid
-#   sudo-timer off          stäng av direkt
+#   sudo-timer              pick a duration from a menu
+#   sudo-timer 15m          enable for 15 minutes
+#   sudo-timer 6h           enable for 6 hours
+#   sudo-timer forever      enable until you turn it off
+#   sudo-timer status       show mode and time left
+#   sudo-timer off          revoke now
 #
-# Regeln läggs som en drop-in i /etc/sudoers.d och tas bort på tre sätt:
-# en systemd-timer när tiden gått ut, "sudo-timer off", och vid omstart
-# (allt utom "forever", som är avsett att överleva omstart).
+# The rule is a drop-in in /etc/sudoers.d and three things remove it again:
+# a systemd timer when the window expires, "sudo-timer off", and a boot-time
+# cleanup (everything except "forever", which is meant to survive a reboot).
 
 set -euo pipefail
 
@@ -28,16 +28,16 @@ BOOT_UNIT="/etc/systemd/system/${BOOT_UNIT_NAME}"
 
 assume_yes=false
 
-# Menyval. "forever" = ingen utgång.
+# Menu choices. "forever" = no expiry.
 choices=(
-  "5 minuter|300"
-  "15 minuter|900"
-  "30 minuter|1800"
-  "1 timme|3600"
-  "6 timmar|21600"
-  "12 timmar|43200"
-  "24 timmar|86400"
-  "Obestämd tid|forever"
+  "5 minutes|300"
+  "15 minutes|900"
+  "30 minutes|1800"
+  "1 hour|3600"
+  "6 hours|21600"
+  "12 hours|43200"
+  "24 hours|86400"
+  "Forever|forever"
 )
 
 die() {
@@ -49,11 +49,11 @@ usage() {
   sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# "90" = minuter. Annars 30s / 15m / 6h / forever.
+# "90" = minutes. Otherwise 30s / 15m / 6h / forever.
 parse_duration() {
   local input=${1,,}
   case $input in
-    forever | inf | infinite | permanent | alltid | obestämd | obestamd)
+    forever | inf | infinite | permanent)
       echo forever
       return 0
       ;;
@@ -83,8 +83,8 @@ human_duration() {
   fi
 }
 
-# Undviker lösenordsprompt: utan cachad behörighet och utan NOPASSWD-regel
-# kan läget inte vara påslaget ändå.
+# Avoids a password prompt: without cached credentials and without a NOPASSWD
+# rule, the mode cannot be on anyway.
 have_root_now() { sudo -n true 2>/dev/null; }
 
 current_mode() {
@@ -101,7 +101,7 @@ current_mode() {
   fi
 }
 
-# Sekunder kvar på vår egen timer, från utgångsstämpeln i /run.
+# Seconds left on our own timer, from the expiry stamp in /run.
 remaining_own() {
   local expires now
   [[ -r $STATE_FILE ]] || return 1
@@ -112,7 +112,7 @@ remaining_own() {
   echo $((expires - now))
 }
 
-# Sekunder kvar på omarchys timer, som vi inte äger.
+# Seconds left on omarchy's timer, which we do not own.
 remaining_omarchy() {
   local next now
   command -v jq >/dev/null || return 1
@@ -131,14 +131,14 @@ stop_timer() {
   sudo systemctl reset-failed "${unit}.timer" "${unit}.service" 2>/dev/null || true
 }
 
-# En tidsstämplad timer (inte --on-active): OnCalendar följer väggklockan och
-# löper ut även om maskinen har varit i viloläge däremellan.
+# A wall-clock timer (not --on-active): OnCalendar follows the clock and
+# expires even if the machine was suspended in between.
 arm_timer() {
   local secs=$1 at
   at=$(date -d "+${secs} seconds" '+%Y-%m-%d %H:%M:%S')
   stop_timer "$TIMER_UNIT"
   local out
-  # systemd-run skriver alltid två rader till stderr; visa dem bara vid fel.
+  # systemd-run always writes two lines to stderr; only show them on failure.
   if ! out=$(sudo systemd-run \
     --on-calendar="$at" \
     --timer-property=AccuracySec=1s \
@@ -149,13 +149,13 @@ arm_timer() {
   fi
 }
 
-# Städar bort tidsbegränsade regler tidigt i uppstarten. Transienta timers
-# överlever inte en omstart, men drop-in-filen gör det.
+# Clears timed rules early during boot. Transient timers do not survive a
+# reboot, but the drop-in file does.
 ensure_boot_cleanup() {
   [[ -f $BOOT_UNIT ]] && return 0
   sudo tee "$BOOT_UNIT" >/dev/null <<UNIT
 [Unit]
-Description=Ta bort utgångna sudo-timer-regler vid uppstart
+Description=Remove expired sudo-timer rules at boot
 DefaultDependencies=no
 After=local-fs.target
 Before=sysinit.target
@@ -171,47 +171,47 @@ UNIT
   sudo systemctl enable "$BOOT_UNIT_NAME" >/dev/null 2>&1
 }
 
-# Validera alltid innan installation — en trasig fil i /etc/sudoers.d
-# kan låsa ute all sudo-användning.
+# Always validate before installing — a malformed file in /etc/sudoers.d
+# can lock you out of sudo entirely.
 install_rule() {
   local target=$1 tmp
-  tmp=$(mktemp) || die "kunde inte skapa temporär fil"
+  tmp=$(mktemp) || die "could not create a temporary file"
   printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$USER_NAME" >"$tmp"
   if ! visudo -cf "$tmp" >/dev/null; then
     rm -f "$tmp"
-    die "genererad sudoers-regel underkändes av visudo — inget ändrat"
+    die "generated sudoers rule was rejected by visudo — nothing changed"
   fi
   sudo install -m 0440 -o root -g root "$tmp" "$target"
   rm -f "$tmp"
 }
 
-# Alla vägar till lösenordsfri sudo för den här användaren, så att "off"
-# verkligen betyder att lösenordet är tillbaka.
+# Every route to passwordless sudo for this user, so that "off" really means
+# the password is back.
 revoke_all() {
   local had_omarchy=false
   sudo test -f "$OMARCHY_FILE" && had_omarchy=true
 
-  # Ordningen är viktig: regelfilen är det enda som ger oss root här, så den
-  # tas bort sist. Tvärtom slutar resten av stegen att fungera halvvägs.
+  # Order matters: the rule file is the only thing granting us root here, so it
+  # goes last. The other way around, the remaining steps break halfway through.
   stop_timer "$TIMER_UNIT"
   $had_omarchy && stop_timer "$OMARCHY_TIMER"
   sudo rm -f -- "$TIMED_FILE" "$FOREVER_FILE" "$OMARCHY_FILE" "$STATE_FILE"
   sudo -k
 
-  $had_omarchy && echo "Tog även bort omarchys regel ($(basename "$OMARCHY_FILE"))."
+  $had_omarchy && echo "Also removed omarchy's rule ($(basename "$OMARCHY_FILE"))."
   return 0
 }
 
 confirm() {
   local prompt=$1
   $assume_yes && return 0
-  [[ -t 0 ]] || die "ingen terminal för bekräftelse — kör med --yes"
+  [[ -t 0 ]] || die "no terminal to confirm on — run with --yes"
   if command -v gum >/dev/null; then
     gum confirm --default=false "$prompt"
   else
     local answer
-    read -r -p "$prompt [j/N] " answer
-    [[ ${answer,,} == j* ]]
+    read -r -p "$prompt [y/N] " answer
+    [[ ${answer,,} == y* ]]
   fi
 }
 
@@ -219,9 +219,9 @@ warn_block() {
   local window=$1
   cat <<TXT
 
-  ⚠  Varning
-  Varje process som kör som $USER_NAME får köra vad som helst som root
-  utan lösenord — $window. Det gäller även skript och agenter du startat.
+  ⚠  Warning
+  Any process running as $USER_NAME may run anything as root without a
+  password — $window. That includes scripts and agents you started.
 
 TXT
 }
@@ -231,55 +231,55 @@ cmd_status() {
   mode=$(current_mode)
   case $mode in
     forever)
-      echo "Lösenordsfri sudo: PÅ — obestämd tid (överlever omstart)."
-      echo "Stäng av med: sudo-timer off"
+      echo "Passwordless sudo: ON — forever (survives a reboot)."
+      echo "Turn off with: sudo-timer off"
       ;;
     timed)
       if secs=$(remaining_own); then
-        echo "Lösenordsfri sudo: PÅ — $(human_duration "$secs") kvar (till $(date -d "@$(($(date +%s) + secs))" '+%H:%M'))."
+        echo "Passwordless sudo: ON — $(human_duration "$secs") left (until $(date -d "@$(($(date +%s) + secs))" '+%H:%M'))."
       else
-        echo "Lösenordsfri sudo: PÅ — tidsbegränsad, återstående tid okänd."
+        echo "Passwordless sudo: ON — timed, time left unknown."
       fi
       ;;
     omarchy)
       if secs=$(remaining_omarchy); then
-        echo "Lösenordsfri sudo: PÅ via omarchy — $(human_duration "$secs") kvar."
+        echo "Passwordless sudo: ON via omarchy — $(human_duration "$secs") left."
       else
-        echo "Lösenordsfri sudo: PÅ via omarchy."
+        echo "Passwordless sudo: ON via omarchy."
       fi
       ;;
-    none) echo "Lösenordsfri sudo: AV — sudo frågar efter lösenord." ;;
+    none) echo "Passwordless sudo: OFF — sudo asks for a password." ;;
   esac
 }
 
 cmd_off() {
   if [[ $(current_mode) == none ]]; then
-    echo "Lösenordsfri sudo är redan av."
+    echo "Passwordless sudo is already off."
     return 0
   fi
   revoke_all
-  echo "Lösenordsfri sudo är AV. Sudo frågar efter lösenord igen."
+  echo "Passwordless sudo is OFF. Sudo asks for a password again."
 }
 
 cmd_enable() {
   local spec=$1 secs window
-  secs=$(parse_duration "$spec") || die "förstod inte tiden \"$spec\" (t.ex. 15m, 6h, 24h, forever)"
+  secs=$(parse_duration "$spec") || die "could not read the duration \"$spec\" (try 15m, 6h, 24h, forever)"
 
   if [[ $secs == forever ]]; then
-    window="tills du stänger av det själv"
+    window="until you turn it off yourself"
   else
-    window="i $(human_duration "$secs"), till $(date -d "+${secs} seconds" '+%H:%M')"
+    window="for $(human_duration "$secs"), until $(date -d "+${secs} seconds" '+%H:%M')"
   fi
 
   warn_block "$window"
-  confirm "Slå på lösenordsfri sudo $window?" || {
-    echo "Avbrutet. Inget ändrat."
+  confirm "Enable passwordless sudo $window?" || {
+    echo "Aborted. Nothing changed."
     return 1
   }
 
-  # Kräv lösenordet nu om det behövs, så att stegen nedan inte avbryts halvvägs.
-  # "sudo true" matchar sudoers som vilket kommando som helst; "sudo -v" frågar
-  # efter lösenord även när en NOPASSWD-regel redan gäller.
+  # Ask for the password now if needed, so the steps below are not interrupted
+  # halfway. "sudo true" matches sudoers like any other command; "sudo -v" asks
+  # for a password even when a NOPASSWD rule already applies.
   sudo true
 
   if [[ $secs == forever ]]; then
@@ -292,12 +292,12 @@ cmd_enable() {
     sudo rm -f -- "$FOREVER_FILE"
     if ! arm_timer "$secs"; then
       sudo rm -f -- "$TIMED_FILE"
-      die "kunde inte schemalägga utgången — regeln togs bort igen"
+      die "could not schedule the expiry — the rule was removed again"
     fi
     date -d "+${secs} seconds" +%s | sudo tee "$STATE_FILE" >/dev/null
   fi
 
-  # Omarchys egen regel skulle annars leva kvar med sin egen livslängd.
+  # Omarchy's own rule would otherwise live on with its own lifetime.
   if sudo test -f "$OMARCHY_FILE"; then
     sudo rm -f -- "$OMARCHY_FILE"
     stop_timer "$OMARCHY_TIMER"
@@ -316,17 +316,17 @@ cmd_menu() {
   echo
 
   if command -v gum >/dev/null && [[ -t 0 ]]; then
-    label=$(gum choose --header="Lösenordsfri sudo i hur länge?" "${labels[@]}" "Stäng av nu" "Avbryt") || return 1
+    label=$(gum choose --header="Passwordless sudo for how long?" "${labels[@]}" "Turn off now" "Cancel") || return 1
   else
-    PS3="Välj [1-$((${#labels[@]} + 2))]: "
-    select label in "${labels[@]}" "Stäng av nu" "Avbryt"; do
+    PS3="Choose [1-$((${#labels[@]} + 2))]: "
+    select label in "${labels[@]}" "Turn off now" "Cancel"; do
       [[ -n ${label:-} ]] && break
     done
   fi
 
-  case ${label:-Avbryt} in
-    Avbryt | "") echo "Avbrutet."; return 0 ;;
-    "Stäng av nu") cmd_off; return 0 ;;
+  case ${label:-Cancel} in
+    Cancel | "") echo "Aborted."; return 0 ;;
+    "Turn off now") cmd_off; return 0 ;;
   esac
 
   for entry in "${choices[@]}"; do
@@ -353,7 +353,7 @@ main() {
   case ${args[0]:-menu} in
     menu) cmd_menu ;;
     status | -s) cmd_status ;;
-    off | av | revoke | disable) cmd_off ;;
+    off | revoke | disable) cmd_off ;;
     *) cmd_enable "${args[0]}" ;;
   esac
 }
