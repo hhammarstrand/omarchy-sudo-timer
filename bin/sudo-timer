@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+#
+# sudo-timer — lösenordsfri sudo under en vald tid.
+#
+#   sudo-timer              välj tid i en meny
+#   sudo-timer 15m          aktivera i 15 minuter
+#   sudo-timer 6h           aktivera i 6 timmar
+#   sudo-timer forever      aktivera tills vidare
+#   sudo-timer status       visa läge och återstående tid
+#   sudo-timer off          stäng av direkt
+#
+# Regeln läggs som en drop-in i /etc/sudoers.d och tas bort på tre sätt:
+# en systemd-timer när tiden gått ut, "sudo-timer off", och vid omstart
+# (allt utom "forever", som är avsett att överleva omstart).
+
+set -euo pipefail
+
+USER_NAME=${SUDO_USER:-$USER}
+
+TIMED_FILE="/etc/sudoers.d/99-sudo-timer-${USER_NAME}"
+FOREVER_FILE="/etc/sudoers.d/99-sudo-forever-${USER_NAME}"
+OMARCHY_FILE="/etc/sudoers.d/99-omarchy-nopasswd-${USER_NAME}"
+OMARCHY_TIMER="omarchy-nopasswd-expire-${USER_NAME}"
+TIMER_UNIT="sudo-timer-expire-${USER_NAME}"
+STATE_FILE="/run/sudo-timer-${USER_NAME}.expires"
+BOOT_UNIT_NAME="sudo-timer-boot-cleanup.service"
+BOOT_UNIT="/etc/systemd/system/${BOOT_UNIT_NAME}"
+
+assume_yes=false
+
+# Menyval. "forever" = ingen utgång.
+choices=(
+  "5 minuter|300"
+  "15 minuter|900"
+  "30 minuter|1800"
+  "1 timme|3600"
+  "6 timmar|21600"
+  "12 timmar|43200"
+  "24 timmar|86400"
+  "Obestämd tid|forever"
+)
+
+die() {
+  echo "sudo-timer: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# "90" = minuter. Annars 30s / 15m / 6h / forever.
+parse_duration() {
+  local input=${1,,}
+  case $input in
+    forever | inf | infinite | permanent | alltid | obestämd | obestamd)
+      echo forever
+      return 0
+      ;;
+  esac
+  if [[ $input =~ ^([0-9]+)$ ]]; then
+    echo $((${BASH_REMATCH[1]} * 60))
+  elif [[ $input =~ ^([0-9]+)s$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  elif [[ $input =~ ^([0-9]+)m(in)?$ ]]; then
+    echo $((${BASH_REMATCH[1]} * 60))
+  elif [[ $input =~ ^([0-9]+)h$ ]]; then
+    echo $((${BASH_REMATCH[1]} * 3600))
+  else
+    return 1
+  fi
+}
+
+human_duration() {
+  local secs=$1
+  if ((secs >= 3600)); then
+    local h=$((secs / 3600)) m=$((secs % 3600 / 60))
+    if ((m)); then echo "${h} h ${m} min"; else echo "${h} h"; fi
+  elif ((secs >= 60)); then
+    echo "$((secs / 60)) min"
+  else
+    echo "${secs} s"
+  fi
+}
+
+# Undviker lösenordsprompt: utan cachad behörighet och utan NOPASSWD-regel
+# kan läget inte vara påslaget ändå.
+have_root_now() { sudo -n true 2>/dev/null; }
+
+current_mode() {
+  if ! have_root_now; then
+    echo none
+  elif sudo -n test -f "$FOREVER_FILE"; then
+    echo forever
+  elif sudo -n test -f "$TIMED_FILE"; then
+    echo timed
+  elif sudo -n test -f "$OMARCHY_FILE"; then
+    echo omarchy
+  else
+    echo none
+  fi
+}
+
+# Sekunder kvar på vår egen timer, från utgångsstämpeln i /run.
+remaining_own() {
+  local expires now
+  [[ -r $STATE_FILE ]] || return 1
+  expires=$(<"$STATE_FILE")
+  [[ $expires =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  ((expires > now)) || return 1
+  echo $((expires - now))
+}
+
+# Sekunder kvar på omarchys timer, som vi inte äger.
+remaining_omarchy() {
+  local next now
+  command -v jq >/dev/null || return 1
+  next=$(systemctl list-timers --all --output=json 2>/dev/null |
+    jq -r --arg u "${OMARCHY_TIMER}.timer" '.[] | select(.unit == $u) | .next') || return 1
+  [[ $next =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  next=$((next / 1000000))
+  ((next > now)) || return 1
+  echo $((next - now))
+}
+
+stop_timer() {
+  local unit=$1
+  sudo systemctl stop "${unit}.timer" 2>/dev/null || true
+  sudo systemctl reset-failed "${unit}.timer" "${unit}.service" 2>/dev/null || true
+}
+
+# En tidsstämplad timer (inte --on-active): OnCalendar följer väggklockan och
+# löper ut även om maskinen har varit i viloläge däremellan.
+arm_timer() {
+  local secs=$1 at
+  at=$(date -d "+${secs} seconds" '+%Y-%m-%d %H:%M:%S')
+  stop_timer "$TIMER_UNIT"
+  local out
+  # systemd-run skriver alltid två rader till stderr; visa dem bara vid fel.
+  if ! out=$(sudo systemd-run \
+    --on-calendar="$at" \
+    --timer-property=AccuracySec=1s \
+    --unit="$TIMER_UNIT" \
+    /usr/bin/rm -f -- "$TIMED_FILE" "$STATE_FILE" 2>&1); then
+    echo "$out" >&2
+    return 1
+  fi
+}
+
+# Städar bort tidsbegränsade regler tidigt i uppstarten. Transienta timers
+# överlever inte en omstart, men drop-in-filen gör det.
+ensure_boot_cleanup() {
+  [[ -f $BOOT_UNIT ]] && return 0
+  sudo tee "$BOOT_UNIT" >/dev/null <<UNIT
+[Unit]
+Description=Ta bort utgångna sudo-timer-regler vid uppstart
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /etc/sudoers.d -maxdepth 1 -name '99-sudo-timer-*' -delete
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$BOOT_UNIT_NAME" >/dev/null 2>&1
+}
+
+# Validera alltid innan installation — en trasig fil i /etc/sudoers.d
+# kan låsa ute all sudo-användning.
+install_rule() {
+  local target=$1 tmp
+  tmp=$(mktemp) || die "kunde inte skapa temporär fil"
+  printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$USER_NAME" >"$tmp"
+  if ! visudo -cf "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    die "genererad sudoers-regel underkändes av visudo — inget ändrat"
+  fi
+  sudo install -m 0440 -o root -g root "$tmp" "$target"
+  rm -f "$tmp"
+}
+
+# Alla vägar till lösenordsfri sudo för den här användaren, så att "off"
+# verkligen betyder att lösenordet är tillbaka.
+revoke_all() {
+  local had_omarchy=false
+  sudo test -f "$OMARCHY_FILE" && had_omarchy=true
+
+  # Ordningen är viktig: regelfilen är det enda som ger oss root här, så den
+  # tas bort sist. Tvärtom slutar resten av stegen att fungera halvvägs.
+  stop_timer "$TIMER_UNIT"
+  $had_omarchy && stop_timer "$OMARCHY_TIMER"
+  sudo rm -f -- "$TIMED_FILE" "$FOREVER_FILE" "$OMARCHY_FILE" "$STATE_FILE"
+  sudo -k
+
+  $had_omarchy && echo "Tog även bort omarchys regel ($(basename "$OMARCHY_FILE"))."
+  return 0
+}
+
+confirm() {
+  local prompt=$1
+  $assume_yes && return 0
+  [[ -t 0 ]] || die "ingen terminal för bekräftelse — kör med --yes"
+  if command -v gum >/dev/null; then
+    gum confirm --default=false "$prompt"
+  else
+    local answer
+    read -r -p "$prompt [j/N] " answer
+    [[ ${answer,,} == j* ]]
+  fi
+}
+
+warn_block() {
+  local window=$1
+  cat <<TXT
+
+  ⚠  Varning
+  Varje process som kör som $USER_NAME får köra vad som helst som root
+  utan lösenord — $window. Det gäller även skript och agenter du startat.
+
+TXT
+}
+
+cmd_status() {
+  local mode secs
+  mode=$(current_mode)
+  case $mode in
+    forever)
+      echo "Lösenordsfri sudo: PÅ — obestämd tid (överlever omstart)."
+      echo "Stäng av med: sudo-timer off"
+      ;;
+    timed)
+      if secs=$(remaining_own); then
+        echo "Lösenordsfri sudo: PÅ — $(human_duration "$secs") kvar (till $(date -d "@$(($(date +%s) + secs))" '+%H:%M'))."
+      else
+        echo "Lösenordsfri sudo: PÅ — tidsbegränsad, återstående tid okänd."
+      fi
+      ;;
+    omarchy)
+      if secs=$(remaining_omarchy); then
+        echo "Lösenordsfri sudo: PÅ via omarchy — $(human_duration "$secs") kvar."
+      else
+        echo "Lösenordsfri sudo: PÅ via omarchy."
+      fi
+      ;;
+    none) echo "Lösenordsfri sudo: AV — sudo frågar efter lösenord." ;;
+  esac
+}
+
+cmd_off() {
+  if [[ $(current_mode) == none ]]; then
+    echo "Lösenordsfri sudo är redan av."
+    return 0
+  fi
+  revoke_all
+  echo "Lösenordsfri sudo är AV. Sudo frågar efter lösenord igen."
+}
+
+cmd_enable() {
+  local spec=$1 secs window
+  secs=$(parse_duration "$spec") || die "förstod inte tiden \"$spec\" (t.ex. 15m, 6h, 24h, forever)"
+
+  if [[ $secs == forever ]]; then
+    window="tills du stänger av det själv"
+  else
+    window="i $(human_duration "$secs"), till $(date -d "+${secs} seconds" '+%H:%M')"
+  fi
+
+  warn_block "$window"
+  confirm "Slå på lösenordsfri sudo $window?" || {
+    echo "Avbrutet. Inget ändrat."
+    return 1
+  }
+
+  # Kräv lösenordet nu om det behövs, så att stegen nedan inte avbryts halvvägs.
+  # "sudo true" matchar sudoers som vilket kommando som helst; "sudo -v" frågar
+  # efter lösenord även när en NOPASSWD-regel redan gäller.
+  sudo true
+
+  if [[ $secs == forever ]]; then
+    install_rule "$FOREVER_FILE"
+    sudo rm -f -- "$TIMED_FILE" "$STATE_FILE"
+    stop_timer "$TIMER_UNIT"
+  else
+    ensure_boot_cleanup
+    install_rule "$TIMED_FILE"
+    sudo rm -f -- "$FOREVER_FILE"
+    if ! arm_timer "$secs"; then
+      sudo rm -f -- "$TIMED_FILE"
+      die "kunde inte schemalägga utgången — regeln togs bort igen"
+    fi
+    date -d "+${secs} seconds" +%s | sudo tee "$STATE_FILE" >/dev/null
+  fi
+
+  # Omarchys egen regel skulle annars leva kvar med sin egen livslängd.
+  if sudo test -f "$OMARCHY_FILE"; then
+    sudo rm -f -- "$OMARCHY_FILE"
+    stop_timer "$OMARCHY_TIMER"
+  fi
+
+  echo
+  cmd_status
+}
+
+cmd_menu() {
+  local labels=() label spec=""
+  for entry in "${choices[@]}"; do labels+=("${entry%%|*}"); done
+
+  echo
+  cmd_status
+  echo
+
+  if command -v gum >/dev/null && [[ -t 0 ]]; then
+    label=$(gum choose --header="Lösenordsfri sudo i hur länge?" "${labels[@]}" "Stäng av nu" "Avbryt") || return 1
+  else
+    PS3="Välj [1-$((${#labels[@]} + 2))]: "
+    select label in "${labels[@]}" "Stäng av nu" "Avbryt"; do
+      [[ -n ${label:-} ]] && break
+    done
+  fi
+
+  case ${label:-Avbryt} in
+    Avbryt | "") echo "Avbrutet."; return 0 ;;
+    "Stäng av nu") cmd_off; return 0 ;;
+  esac
+
+  for entry in "${choices[@]}"; do
+    if [[ ${entry%%|*} == "$label" ]]; then spec=${entry##*|}; fi
+  done
+  [[ $spec == forever ]] || spec="${spec}s"
+  cmd_enable "$spec"
+}
+
+main() {
+  local args=()
+  while (($#)); do
+    case $1 in
+      -y | --yes) assume_yes=true ;;
+      -h | --help)
+        usage
+        return 0
+        ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+
+  case ${args[0]:-menu} in
+    menu) cmd_menu ;;
+    status | -s) cmd_status ;;
+    off | av | revoke | disable) cmd_off ;;
+    *) cmd_enable "${args[0]}" ;;
+  esac
+}
+
+main "$@"
